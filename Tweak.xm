@@ -208,9 +208,6 @@ static UIViewController *findTopViewController(void) {
     [picker dismissViewControllerAnimated:YES completion:nil];
     
     NSURL *videoURL = info[UIImagePickerControllerMediaURL];
-    if (!videoURL) {
-        videoURL = info[UIImagePickerControllerReferenceURL];
-    }
     if (!videoURL) return;
     
     [[MediaManager sharedManager] loadMediaFromURL:videoURL];
