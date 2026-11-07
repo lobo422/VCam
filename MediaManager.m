@@ -94,51 +94,58 @@ static CVPixelBufferRef pixelBufferFromJPEGData(NSData *data) {
     self.isNetworkStreamActive = YES;
     self.mode = VCamModeStream;
     
+    // TCP Server listening on 0.0.0.0:port (Enables USB usbmux forward & direct Wi-Fi streaming)
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) return;
+        
+        int opt = 1;
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        
+        struct sockaddr_in serv_addr;
+        memset(&serv_addr, 0, sizeof(serv_addr));
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_addr.s_addr = INADDR_ANY;
+        serv_addr.sin_port = htons(port);
+        
+        if (bind(server_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+            close(server_fd);
+            return;
+        }
+        
+        if (listen(server_fd, 5) < 0) {
+            close(server_fd);
+            return;
+        }
+        
+        NSLog(@"[VCam] Stream Server listening on 0.0.0.0:%d", port);
+        
         while (self.isNetworkStreamActive) {
-            int sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (sock < 0) {
-                [NSThread sleepForTimeInterval:1.0];
+            struct sockaddr_in client_addr;
+            socklen_t addrlen = sizeof(client_addr);
+            int client_sock = accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
+            if (client_sock < 0) {
+                [NSThread sleepForTimeInterval:0.5];
                 continue;
             }
             
-            struct sockaddr_in serv_addr;
-            memset(&serv_addr, 0, sizeof(serv_addr));
-            serv_addr.sin_family = AF_INET;
-            serv_addr.sin_port = htons(port);
-            inet_pton(AF_INET, [host UTF8String], &serv_addr.sin_addr);
+            NSLog(@"[VCam] Stream Client connected!");
             
-            if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-                close(sock);
-                [NSThread sleepForTimeInterval:1.0];
-                continue;
-            }
-            
-            self->_socketFd = sock;
-            NSLog(@"[VCam] Connected to PC Stream Server at %@:%d!", host, port);
-            
-            // Read stream loop
             while (self.isNetworkStreamActive) {
-                // Read 4 bytes magic + 1 byte type + 4 bytes length = 9 bytes header
                 uint8_t header[9];
-                ssize_t n = recv(sock, header, 9, MSG_WAITALL);
-                if (n != 9) break; // Disconnected
-                
-                if (memcmp(header, "LIVE", 4) != 0) {
-                    break; // Invalid magic
-                }
+                ssize_t n = recv(client_sock, header, 9, MSG_WAITALL);
+                if (n != 9) break;
+                if (memcmp(header, "LIVE", 4) != 0) break;
                 
                 uint8_t type = header[4];
                 uint32_t length = (header[5] << 24) | (header[6] << 16) | (header[7] << 8) | header[8];
-                
-                if (length > 10 * 1024 * 1024) break; // sanity limit 10MB
+                if (length > 10 * 1024 * 1024) break;
                 
                 NSMutableData *payload = [NSMutableData dataWithLength:length];
-                n = recv(sock, [payload mutableBytes], length, MSG_WAITALL);
+                n = recv(client_sock, [payload mutableBytes], length, MSG_WAITALL);
                 if (n != length) break;
                 
                 if (type == 0x01) {
-                    // Video Frame (JPEG)
                     CVPixelBufferRef newBuf = pixelBufferFromJPEGData(payload);
                     if (newBuf) {
                         @synchronized (self) {
@@ -150,69 +157,15 @@ static CVPixelBufferRef pixelBufferFromJPEGData(NSData *data) {
                     }
                 }
             }
-            
-            close(sock);
-            self->_socketFd = -1;
-            [NSThread sleepForTimeInterval:1.0];
+            close(client_sock);
         }
+        close(server_fd);
     });
 }
 
 - (void)stopNetworkStream {
     self.isNetworkStreamActive = NO;
-    if (_socketFd >= 0) {
-        close(_socketFd);
-        _socketFd = -1;
-    }
 }
-
-#pragma mark - Media Loading (Fallback local file)
-
-- (void)loadMediaFromURL:(NSURL *)url {
-    dispatch_async(_decodeQueue, ^{
-        AVAsset *asset = [AVAsset assetWithURL:url];
-        if (!asset) return;
-        
-        self.currentAsset = asset;
-        self.videoDuration = asset.duration;
-        
-        NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
-        if (tracks.count > 0) {
-            AVAssetTrack *track = tracks.firstObject;
-            CGSize size = track.naturalSize;
-            CGAffineTransform t = track.preferredTransform;
-            size = CGSizeApplyAffineTransform(size, t);
-            size.width = fabs(size.width);
-            size.height = fabs(size.height);
-            if (size.width > 0 && size.height > 0) {
-                self.videoSize = size;
-            }
-        }
-        
-        [self resetReaders];
-        self.mode = VCamModeVideo;
-    });
-}
-
-- (void)resetReaders {
-    NSError *error = nil;
-    if (self.currentAsset) {
-        self.videoReader = [AVAssetReader assetReaderWithAsset:self.currentAsset error:&error];
-        NSArray<AVAssetTrack *> *videoTracks = [self.currentAsset tracksWithMediaType:AVMediaTypeVideo];
-        if (videoTracks.count > 0) {
-            NSDictionary *settings = @{
-                (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-            };
-            self.videoOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTracks.firstObject
-                                                                          outputSettings:settings];
-            self.videoOutput.alwaysCopiesSampleData = NO;
-            [self.videoReader addOutput:self.videoOutput];
-        }
-        [self.videoReader startReading];
-    }
-}
-
-#pragma mark - Frame Generation
 
 - (CMSampleBufferRef)nextVideoFrame {
     // 1. If in Live PC Stream mode:
