@@ -9,7 +9,7 @@ on:
 jobs:
   build:
     name: Build iOS Tweak
-    runs-on: macos-latest    
+    runs-on: macos-13
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -58,9 +58,7 @@ jobs:
         cp "$DEB" output/
         cd output
         ar x ../packages/*.deb 2>/dev/null || dpkg-deb -x "$DEB" .
-        # Try to find dylib in extracted contents
         find . -name "*.dylib" -exec cp {} ./VCam.dylib \; 2>/dev/null
-        # If ar worked, try tar
         tar -xf data.tar* 2>/dev/null && find . -name "*.dylib" -exec cp {} ./VCam.dylib \; 2>/dev/null
         ls -lh
 

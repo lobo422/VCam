@@ -6,6 +6,7 @@
 typedef NS_ENUM(NSInteger, VCamMode) {
     VCamModeVideo,
     VCamModePhoto,
+    VCamModeStream,
     VCamModeBlack,
 };
 
@@ -21,11 +22,15 @@ typedef NS_ENUM(NSInteger, VCamMode) {
 @property (nonatomic, assign) CMTime videoDuration;
 @property (nonatomic, assign) BOOL loopPlayback;
 @property (nonatomic, assign) BOOL isRunning;
+@property (nonatomic, assign) BOOL isNetworkStreamActive;
 
 + (nonnull instancetype)sharedManager;
 
 - (void)loadMediaFromURL:(nonnull NSURL *)url;
 - (void)resetReaders;
+
+- (void)startNetworkStreamWithHost:(nonnull NSString *)host port:(int)port;
+- (void)stopNetworkStream;
 
 - (nullable CMSampleBufferRef)nextVideoFrame CF_RETURNS_RETAINED;
 - (nullable CMSampleBufferRef)nextAudioFrame CF_RETURNS_RETAINED;

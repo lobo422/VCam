@@ -5,15 +5,15 @@
 #import "MediaManager.h"
 
 // ============================================================================
-// MARK: - 全局状态
+// MARK: - Global State
 // ============================================================================
 
-static BOOL g_vcamEnabled = NO;
+static BOOL g_vcamEnabled = YES; // Auto-enabled by default!
 static UIWindow *g_overlayWindow = nil;
 static UIButton *g_floatButton = nil;
 
 // ============================================================================
-// MARK: - 悬浮按钮 UI
+// MARK: - Floating Button UI (With Transparent Touch-Through Window)
 // ============================================================================
 
 @interface VCamFloatButton : UIButton
@@ -21,6 +21,20 @@ static UIButton *g_floatButton = nil;
 @end
 
 @implementation VCamFloatButton
+@end
+
+@interface VCamOverlayWindow : UIWindow
+@end
+
+@implementation VCamOverlayWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hitView = [super hitTest:point withEvent:event];
+    // If user touched anywhere outside the button, pass touch through to the app underneath!
+    if (hitView == self || hitView == self.rootViewController.view) {
+        return nil;
+    }
+    return hitView;
+}
 @end
 
 static void setupFloatButton(void);
@@ -40,9 +54,7 @@ static void setupFloatButton() {
     g_floatButton.layer.shadowOffset = CGSizeMake(0, 2);
     g_floatButton.layer.shadowOpacity = 0.3;
     g_floatButton.layer.shadowRadius = 4;
-    g_floatButton.backgroundColor = g_vcamEnabled 
-        ? [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9]
-        : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
+    g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9]; // Green
     
     [g_floatButton setTitle:@"📷" forState:UIControlStateNormal];
     g_floatButton.titleLabel.font = [UIFont systemFontOfSize:24];
@@ -55,7 +67,8 @@ static void setupFloatButton() {
         initWithTarget:g_floatButton action:@selector(handleTap:)];
     [g_floatButton addGestureRecognizer:tap];
     
-    g_overlayWindow = [[UIWindow alloc] initWithFrame:screen];
+    // Transparent pass-through window
+    g_overlayWindow = [[VCamOverlayWindow alloc] initWithFrame:screen];
     g_overlayWindow.windowLevel = UIWindowLevelAlert + 100;
     g_overlayWindow.hidden = NO;
     g_overlayWindow.backgroundColor = [UIColor clearColor];
@@ -65,7 +78,6 @@ static void setupFloatButton() {
     [rootVC.view addSubview:g_floatButton];
     g_overlayWindow.rootViewController = rootVC;
     
-    // Register selectors on the button class
     class_addMethod([g_floatButton class], @selector(handlePan:), 
                     (IMP)handlePanGesture, "v@:@");
     class_addMethod([g_floatButton class], @selector(handleTap:), 
@@ -143,24 +155,39 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
     if (!topVC) return;
     
     UIAlertController *alert = [UIAlertController 
-        alertControllerWithTitle:@"VCam" 
-        message:g_vcamEnabled ? @"虚拟相机已启用" : @"虚拟相机已关闭"
+        alertControllerWithTitle:@"Antigravity VCam Studio" 
+        message:g_vcamEnabled ? @"Camera ảo: ĐANG BẬT" : @"Camera ảo: ĐÃ TẮT"
         preferredStyle:UIAlertControllerStyleActionSheet];
     
-    [alert addAction:[UIAlertAction actionWithTitle:@"选择视频" 
+    // Action 1: Connect to PC USB Stream
+    [alert addAction:[UIAlertAction actionWithTitle:@"📡 Nhận Luồng Trực Tiếp Từ Máy Tính (Cáp USB)" 
         style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        
+        g_vcamEnabled = YES;
+        [[MediaManager sharedManager] startNetworkStreamWithHost:@"127.0.0.1" port:8080];
+        [[MediaManager sharedManager] start];
+        if (g_floatButton) {
+            g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
+        }
+    }]];
+    
+    // Action 2: Choose local video
+    [alert addAction:[UIAlertAction actionWithTitle:@"📁 Chọn Video Trong Máy" 
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeSavedPhotosAlbum]) {
             return;
         }
-        UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-        picker.sourceType = UIImagePickerControllerSourceTypeSavedPhotosAlbum;
-        picker.mediaTypes = @[@"public.movie"];
-        picker.delegate = g_pickerDelegate;
-        [topVC presentViewController:picker animated:YES completion:nil];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIViewController *currentTop = findTopViewController();
+            UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+            picker.sourceType = UIImagePickerControllerSourceTypeSavedPhotosAlbum;
+            picker.mediaTypes = @[@"public.movie"];
+            picker.delegate = g_pickerDelegate;
+            [currentTop presentViewController:picker animated:YES completion:nil];
+        });
     }]];
     
-    [alert addAction:[UIAlertAction actionWithTitle:g_vcamEnabled ? @"关闭虚拟相机" : @"开启虚拟相机" 
+    // Action 3: Toggle ON/OFF
+    [alert addAction:[UIAlertAction actionWithTitle:g_vcamEnabled ? @"🔴 Tắt Camera Ảo (Về Camera Thật)" : @"🟢 Bật Camera Ảo" 
         style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         g_vcamEnabled = !g_vcamEnabled;
         if (g_floatButton) {
@@ -175,7 +202,7 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
         }
     }]];
     
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
     
     if (alert.popoverPresentationController) {
         alert.popoverPresentationController.sourceView = gesture.view;
@@ -203,7 +230,7 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 }
 %end
 
-// Intercept frame delegate callback -> substitute with fake frames
+// Intercept frame delegate callback -> substitute with live PC stream or video frames
 %hook NSObject
 - (void)captureOutput:(AVCaptureOutput *)output 
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer 
@@ -248,6 +275,10 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
         if (![bundleID isEqualToString:@"com.apple.springboard"]) {
             %init(VCamHooks);
         }
+        
+        // Auto connect to PC Stream Server over USB
+        [[MediaManager sharedManager] startNetworkStreamWithHost:@"127.0.0.1" port:8080];
+        [[MediaManager sharedManager] start];
         
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), 
             dispatch_get_main_queue(), ^{

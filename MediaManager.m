@@ -1,10 +1,19 @@
 #import "MediaManager.h"
 #import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <unistd.h>
 
-@interface MediaManager ()
+@interface MediaManager () {
+    CVPixelBufferRef _streamPixelBuffer;
+    int _socketFd;
+}
 @property (nonatomic, strong) dispatch_queue_t decodeQueue;
 @property (nonatomic, assign) CMTime startTime;
 @property (nonatomic, assign) int64_t frameIndex;
+@property (nonatomic, strong) NSThread *networkThread;
 @end
 
 @implementation MediaManager
@@ -21,18 +30,143 @@
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _mode = VCamModeBlack;
+        _mode = VCamModeStream; // Default to Stream mode from PC!
         _loopPlayback = YES;
         _isRunning = NO;
-        _videoSize = CGSizeMake(1920, 1080);
+        _isNetworkStreamActive = NO;
+        _videoSize = CGSizeMake(1080, 1920);
         _decodeQueue = dispatch_queue_create("com.vcam.decode", DISPATCH_QUEUE_SERIAL);
         _startTime = kCMTimeZero;
         _frameIndex = 0;
+        _streamPixelBuffer = NULL;
+        _socketFd = -1;
     }
     return self;
 }
 
-#pragma mark - Media Loading
+#pragma mark - Live Network Stream (PC to iPhone over USB)
+
+static CVPixelBufferRef pixelBufferFromJPEGData(NSData *data) {
+    if (!data || data.length == 0) return NULL;
+    
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (!source) return NULL;
+    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    CFRelease(source);
+    if (!cgImage) return NULL;
+    
+    size_t width = CGImageGetWidth(cgImage);
+    size_t height = CGImageGetHeight(cgImage);
+    
+    CVPixelBufferRef pxbuffer = NULL;
+    NSDictionary *options = @{
+        (NSString *)kCVPixelBufferCGImageCompatibilityKey: @(YES),
+        (NSString *)kCVPixelBufferCGBitmapContextCompatibilityKey: @(YES),
+        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                          kCVPixelFormatType_32BGRA,
+                                          (__bridge CFDictionaryRef)options,
+                                          &pxbuffer);
+    if (status != kCVReturnSuccess || !pxbuffer) {
+        CGImageRelease(cgImage);
+        return NULL;
+    }
+    
+    CVPixelBufferLockBaseAddress(pxbuffer, 0);
+    void *pxdata = CVPixelBufferGetBaseAddress(pxbuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pxbuffer);
+    
+    CGColorSpaceRef rgbColorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pxdata, width, height, 8, bytesPerRow, rgbColorSpace,
+                                                 kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), cgImage);
+    CGColorSpaceRelease(rgbColorSpace);
+    CGContextRelease(context);
+    
+    CVPixelBufferUnlockBaseAddress(pxbuffer, 0);
+    CGImageRelease(cgImage);
+    return pxbuffer;
+}
+
+- (void)startNetworkStreamWithHost:(NSString *)host port:(int)port {
+    if (self.isNetworkStreamActive) return;
+    self.isNetworkStreamActive = YES;
+    self.mode = VCamModeStream;
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        while (self.isNetworkStreamActive) {
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) {
+                [NSThread sleepForTimeInterval:1.0];
+                continue;
+            }
+            
+            struct sockaddr_in serv_addr;
+            memset(&serv_addr, 0, sizeof(serv_addr));
+            serv_addr.sin_family = AF_INET;
+            serv_addr.sin_port = htons(port);
+            inet_pton(AF_INET, [host UTF8String], &serv_addr.sin_addr);
+            
+            if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+                close(sock);
+                [NSThread sleepForTimeInterval:1.0];
+                continue;
+            }
+            
+            self->_socketFd = sock;
+            NSLog(@"[VCam] Connected to PC Stream Server at %@:%d!", host, port);
+            
+            // Read stream loop
+            while (self.isNetworkStreamActive) {
+                // Read 4 bytes magic + 1 byte type + 4 bytes length = 9 bytes header
+                uint8_t header[9];
+                ssize_t n = recv(sock, header, 9, MSG_WAITALL);
+                if (n != 9) break; // Disconnected
+                
+                if (memcmp(header, "LIVE", 4) != 0) {
+                    break; // Invalid magic
+                }
+                
+                uint8_t type = header[4];
+                uint32_t length = (header[5] << 24) | (header[6] << 16) | (header[7] << 8) | header[8];
+                
+                if (length > 10 * 1024 * 1024) break; // sanity limit 10MB
+                
+                NSMutableData *payload = [NSMutableData dataWithLength:length];
+                n = recv(sock, [payload mutableBytes], length, MSG_WAITALL);
+                if (n != length) break;
+                
+                if (type == 0x01) {
+                    // Video Frame (JPEG)
+                    CVPixelBufferRef newBuf = pixelBufferFromJPEGData(payload);
+                    if (newBuf) {
+                        @synchronized (self) {
+                            if (self->_streamPixelBuffer) {
+                                CVPixelBufferRelease(self->_streamPixelBuffer);
+                            }
+                            self->_streamPixelBuffer = newBuf;
+                        }
+                    }
+                }
+            }
+            
+            close(sock);
+            self->_socketFd = -1;
+            [NSThread sleepForTimeInterval:1.0];
+        }
+    });
+}
+
+- (void)stopNetworkStream {
+    self.isNetworkStreamActive = NO;
+    if (_socketFd >= 0) {
+        close(_socketFd);
+        _socketFd = -1;
+    }
+}
+
+#pragma mark - Media Loading (Fallback local file)
 
 - (void)loadMediaFromURL:(NSURL *)url {
     dispatch_async(_decodeQueue, ^{
@@ -42,7 +176,6 @@
         self.currentAsset = asset;
         self.videoDuration = asset.duration;
         
-        // Get video dimensions
         NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
         if (tracks.count > 0) {
             AVAssetTrack *track = tracks.firstObject;
@@ -63,11 +196,8 @@
 
 - (void)resetReaders {
     NSError *error = nil;
-    
-    // --- Video Reader ---
     if (self.currentAsset) {
         self.videoReader = [AVAssetReader assetReaderWithAsset:self.currentAsset error:&error];
-        
         NSArray<AVAssetTrack *> *videoTracks = [self.currentAsset tracksWithMediaType:AVMediaTypeVideo];
         if (videoTracks.count > 0) {
             NSDictionary *settings = @{
@@ -78,80 +208,75 @@
             self.videoOutput.alwaysCopiesSampleData = NO;
             [self.videoReader addOutput:self.videoOutput];
         }
-        
         [self.videoReader startReading];
-    }
-    
-    // --- Audio Reader ---
-    if (self.currentAsset) {
-        self.audioReader = [AVAssetReader assetReaderWithAsset:self.currentAsset error:&error];
-        
-        NSArray<AVAssetTrack *> *audioTracks = [self.currentAsset tracksWithMediaType:AVMediaTypeAudio];
-        if (audioTracks.count > 0) {
-            NSDictionary *settings = @{
-                AVFormatIDKey: @(kAudioFormatLinearPCM),
-                AVSampleRateKey: @(44100),
-                AVNumberOfChannelsKey: @(1),
-                AVLinearPCMBitDepthKey: @(16),
-                AVLinearPCMIsFloatKey: @(NO),
-                AVLinearPCMIsBigEndianKey: @(NO),
-            };
-            self.audioOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTracks.firstObject
-                                                                          outputSettings:settings];
-            self.audioOutput.alwaysCopiesSampleData = NO;
-            [self.audioReader addOutput:self.audioOutput];
-        }
-        
-        [self.audioReader startReading];
     }
 }
 
 #pragma mark - Frame Generation
 
 - (CMSampleBufferRef)nextVideoFrame {
-    if (self.mode != VCamModeVideo || !self.videoOutput) {
-        CMTime pts = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
-        return [self generateBlackFrameWithSize:self.videoSize presentationTime:pts];
+    // 1. If in Live PC Stream mode:
+    if (self.mode == VCamModeStream) {
+        CVPixelBufferRef buf = NULL;
+        @synchronized (self) {
+            if (_streamPixelBuffer) {
+                buf = CVPixelBufferRetain(_streamPixelBuffer);
+            }
+        }
+        
+        if (buf) {
+            CMVideoFormatDescriptionRef formatDesc = NULL;
+            CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, buf, &formatDesc);
+            
+            CMTime pts = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
+            CMSampleTimingInfo timing = {
+                .duration = CMTimeMake(1, 30),
+                .presentationTimeStamp = pts,
+                .decodeTimeStamp = pts,
+            };
+            
+            CMSampleBufferRef sample = NULL;
+            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault,
+                                               buf,
+                                               YES,
+                                               NULL, NULL,
+                                               formatDesc,
+                                               &timing,
+                                               &sample);
+            if (formatDesc) CFRelease(formatDesc);
+            CVPixelBufferRelease(buf);
+            return sample;
+        }
     }
     
-    CMSampleBufferRef sample = [self.videoOutput copyNextSampleBuffer];
-    
-    // Handle end-of-stream: loop
-    if (!sample) {
-        if (self.loopPlayback) {
+    // 2. Fallback to Local Video mode
+    if (self.mode == VCamModeVideo && self.videoOutput) {
+        CMSampleBufferRef sample = [self.videoOutput copyNextSampleBuffer];
+        if (!sample && self.loopPlayback) {
             [self resetReaders];
             sample = [self.videoOutput copyNextSampleBuffer];
         }
-        if (!sample) {
-            CMTime pts = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
-            return [self generateBlackFrameWithSize:self.videoSize presentationTime:pts];
+        if (sample) {
+            CMTime now = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
+            CMSampleBufferRef retimed = NULL;
+            CMSampleBufferRef copy = NULL;
+            CMSampleBufferCreateCopy(kCFAllocatorDefault, sample, &copy);
+            if (copy) {
+                CMSampleBufferSetOutputPresentationTimeStamp(copy, now);
+                retimed = copy;
+            }
+            CFRelease(sample);
+            return retimed;
         }
     }
     
-    // Re-timestamp to wall clock so AVCapture consumers see continuous PTS
-    CMTime now = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
-    CMSampleBufferRef retimed = NULL;
-    CMSampleBufferRef copy = NULL;
-    
-    CMSampleBufferCreateCopy(kCFAllocatorDefault, sample, &copy);
-    if (copy) {
-        CMSampleBufferSetOutputPresentationTimeStamp(copy, now);
-        retimed = copy;
-    }
-    CFRelease(sample);
-    
-    return retimed;
+    // 3. Fallback to black frame
+    CMTime pts = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
+    return [self generateBlackFrameWithSize:self.videoSize presentationTime:pts];
 }
 
 - (CMSampleBufferRef)nextAudioFrame {
-    if (!self.audioOutput) return NULL;
-    
-    CMSampleBufferRef sample = [self.audioOutput copyNextSampleBuffer];
-    if (!sample && self.loopPlayback) {
-        // Audio reader reset handled separately if needed
-        return NULL;
-    }
-    return sample;
+    return NULL;
 }
 
 #pragma mark - Black Frame
@@ -169,26 +294,21 @@
                                           &pixelBuffer);
     if (status != kCVReturnSuccess || !pixelBuffer) return NULL;
     
-    // Fill with black (zero all planes)
     CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-    
     void *yPlane = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
     size_t yBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
     size_t yHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0);
-    memset(yPlane, 16, yBytesPerRow * yHeight);  // Y=16 for black in limited range, 0 for full
+    memset(yPlane, 16, yBytesPerRow * yHeight);
     
     void *uvPlane = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1);
     size_t uvBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
     size_t uvHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1);
-    memset(uvPlane, 128, uvBytesPerRow * uvHeight);  // UV=128 for neutral chroma
-    
+    memset(uvPlane, 128, uvBytesPerRow * uvHeight);
     CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
     
-    // Create CMVideoFormatDescription
     CMVideoFormatDescriptionRef formatDesc = NULL;
     CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDesc);
     
-    // Create CMSampleBuffer
     CMSampleBufferRef sampleBuffer = NULL;
     CMSampleTimingInfo timing = {
         .duration = CMTimeMake(1, 30),
@@ -203,10 +323,8 @@
                                        formatDesc,
                                        &timing,
                                        &sampleBuffer);
-    
     if (formatDesc) CFRelease(formatDesc);
     CVPixelBufferRelease(pixelBuffer);
-    
     return sampleBuffer;
 }
 
