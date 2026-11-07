@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #import "MediaManager.h"
@@ -12,9 +13,66 @@
 static BOOL g_vcamEnabled = YES;
 static UIWindow *g_overlayWindow = nil;
 static UIButton *g_floatButton = nil;
+static const char *kVCamOverlayLayerKey = "VCamOverlayLayerKey";
 
 // ============================================================================
-// MARK: - Floating Button UI (With Transparent Touch-Through Window)
+// MARK: - Preview Layer Manager (Overlays Real-Time Video on Camera Viewfinder)
+// ============================================================================
+
+@interface VCamPreviewManager : NSObject
++ (void)registerPreviewLayer:(AVCaptureVideoPreviewLayer *)layer;
++ (void)updateWithCGImage:(CGImageRef)cgImage;
+@end
+
+static NSHashTable *g_activePreviewLayers = nil;
+
+@implementation VCamPreviewManager
+
++ (void)registerPreviewLayer:(AVCaptureVideoPreviewLayer *)layer {
+    if (!layer) return;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        g_activePreviewLayers = [NSHashTable weakObjectsHashTable];
+    });
+    @synchronized (g_activePreviewLayers) {
+        [g_activePreviewLayers addObject:layer];
+    }
+}
+
++ (void)updateWithCGImage:(CGImageRef)cgImage {
+    if (!cgImage || !g_vcamEnabled) return;
+    CGImageRetain(cgImage);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @synchronized (g_activePreviewLayers) {
+            for (AVCaptureVideoPreviewLayer *previewLayer in g_activePreviewLayers) {
+                if (!previewLayer) continue;
+                
+                CALayer *overlay = objc_getAssociatedObject(previewLayer, kVCamOverlayLayerKey);
+                if (!overlay) {
+                    overlay = [CALayer layer];
+                    overlay.contentsGravity = kCAGravityResizeAspectFill;
+                    overlay.frame = previewLayer.bounds;
+                    overlay.zPosition = 999;
+                    [previewLayer addSublayer:overlay];
+                    objc_setAssociatedObject(previewLayer, kVCamOverlayLayerKey, overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+                overlay.frame = previewLayer.bounds;
+                overlay.contents = (__bridge id)cgImage;
+                overlay.hidden = !g_vcamEnabled;
+                [CATransaction commit];
+            }
+        }
+        CGImageRelease(cgImage);
+    });
+}
+
+@end
+
+// ============================================================================
+// MARK: - Floating Button UI (Touch-Through Transparent Window)
 // ============================================================================
 
 @interface VCamFloatButton : UIButton
@@ -45,10 +103,12 @@ static void setupFloatButton() {
     if (g_floatButton) return;
     
     UIWindowScene *activeScene = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
-            activeScene = (UIWindowScene *)scene;
-            break;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
+                activeScene = (UIWindowScene *)scene;
+                break;
+            }
         }
     }
     
@@ -112,13 +172,23 @@ static void handlePanGesture(UIPanGestureRecognizer *gesture) {
 
 static UIViewController *findTopViewController(void) {
     UIViewController *topVC = nil;
-    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *w in scene.windows) {
-                if (w.isKeyWindow) {
-                    topVC = w.rootViewController;
-                    break;
+    if (@available(iOS 13.0, *)) {
+        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *w in scene.windows) {
+                    if (w.isKeyWindow && w != g_overlayWindow) {
+                        topVC = w.rootViewController;
+                        break;
+                    }
                 }
+            }
+        }
+    }
+    if (!topVC) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow && w != g_overlayWindow) {
+                topVC = w.rootViewController;
+                break;
             }
         }
     }
@@ -137,16 +207,13 @@ static UIViewController *findTopViewController(void) {
         didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
     
-    NSURL *url = info[UIImagePickerControllerMediaURL];
-    if (!url) return;
+    NSURL *videoURL = info[UIImagePickerControllerMediaURL];
+    if (!videoURL) {
+        videoURL = info[UIImagePickerControllerReferenceURL];
+    }
+    if (!videoURL) return;
     
-    NSURL *tempURL = [NSURL fileURLWithPath:[NSTemporaryDirectory() 
-        stringByAppendingPathComponent:@"vcam_input.mp4"]];
-    [[NSFileManager defaultManager] removeItemAtURL:tempURL error:nil];
-    [[NSFileManager defaultManager] copyItemAtURL:url toURL:tempURL error:nil];
-    
-    [[MediaManager sharedManager] loadMediaFromURL:tempURL];
-    g_vcamEnabled = YES;
+    [[MediaManager sharedManager] loadMediaFromURL:videoURL];
     [[MediaManager sharedManager] start];
     if (g_floatButton) {
         g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
@@ -166,7 +233,7 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
     if (!topVC) return;
     
     UIAlertController *alert = [UIAlertController 
-        alertControllerWithTitle:@"Antigravity VCam Studio" 
+        alertControllerWithTitle:@"Antigravity Camera Lab" 
         message:g_vcamEnabled ? @"Camera ảo: ĐANG BẬT" : @"Camera ảo: ĐÃ TẮT"
         preferredStyle:UIAlertControllerStyleActionSheet];
     
@@ -224,7 +291,7 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 }
 
 // ============================================================================
-// MARK: - Delegate Proxy Pattern (Universal Video Output Interception)
+// MARK: - Delegate Proxy Pattern (For any API reading raw sample buffers)
 // ============================================================================
 
 @interface VCamSampleBufferProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
@@ -274,7 +341,7 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 @end
 
 // ============================================================================
-// MARK: - Hook AVCaptureSession / Video Output
+// MARK: - Hooks (Targeting Native Camera App com.apple.camera)
 // ============================================================================
 
 %group VCamHooks
@@ -295,6 +362,66 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 }
 - (void)stopRunning {
     %orig;
+}
+%end
+
+%hook AVCaptureVideoPreviewLayer
+
+- (id)initWithSession:(AVCaptureSession *)session {
+    self = %orig;
+    if (self) {
+        [VCamPreviewManager registerPreviewLayer:self];
+    }
+    return self;
+}
+
+- (id)initWithSessionWithNoConnection:(AVCaptureSession *)session {
+    self = %orig;
+    if (self) {
+        [VCamPreviewManager registerPreviewLayer:self];
+    }
+    return self;
+}
+
+- (id)init {
+    self = %orig;
+    if (self) {
+        [VCamPreviewManager registerPreviewLayer:self];
+    }
+    return self;
+}
+
+- (void)setSession:(AVCaptureSession *)session {
+    %orig;
+    [VCamPreviewManager registerPreviewLayer:self];
+}
+
+- (void)layoutSublayers {
+    %orig;
+    [VCamPreviewManager registerPreviewLayer:self];
+    CALayer *overlay = objc_getAssociatedObject(self, kVCamOverlayLayerKey);
+    if (overlay) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        overlay.frame = self.bounds;
+        [CATransaction commit];
+    }
+}
+
+%end
+
+%hook CALayer
+- (void)addSublayer:(CALayer *)layer {
+    %orig;
+    if ([layer isKindOfClass:[AVCaptureVideoPreviewLayer class]]) {
+        [VCamPreviewManager registerPreviewLayer:(AVCaptureVideoPreviewLayer *)layer];
+    }
+}
+- (void)insertSublayer:(CALayer *)layer atIndex:(unsigned)idx {
+    %orig;
+    if ([layer isKindOfClass:[AVCaptureVideoPreviewLayer class]]) {
+        [VCamPreviewManager registerPreviewLayer:(AVCaptureVideoPreviewLayer *)layer];
+    }
 }
 %end
 
@@ -320,22 +447,29 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 
 %ctor {
     @autoreleasepool {
-        g_pickerDelegate = [[VCamImagePickerControllerDelegate alloc] init];
-        
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-        if (![bundleID isEqualToString:@"com.apple.springboard"]) {
+        NSLog(@"[VCam] Injecting into: %@", bundleID);
+        
+        // Strict scope: ONLY activate inside Apple's native Camera app
+        if ([bundleID isEqualToString:@"com.apple.camera"]) {
             %init(VCamHooks);
+            
+            g_pickerDelegate = [[VCamImagePickerControllerDelegate alloc] init];
+            
+            [MediaManager sharedManager].onFrameReceived = ^(UIImage *img) {
+                [VCamPreviewManager updateWithCGImage:img.CGImage];
+            };
+            
+            // Start network stream server on port 8080 (USB port forward)
+            [[MediaManager sharedManager] startNetworkStreamWithHost:@"127.0.0.1" port:8080];
+            [[MediaManager sharedManager] start];
+            
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), 
+                dispatch_get_main_queue(), ^{
+                    @autoreleasepool {
+                        setupFloatButton();
+                    }
+                });
         }
-        
-        // Auto connect to PC Stream Server over USB
-        [[MediaManager sharedManager] startNetworkStreamWithHost:@"127.0.0.1" port:8080];
-        [[MediaManager sharedManager] start];
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), 
-            dispatch_get_main_queue(), ^{
-                @autoreleasepool {
-                    setupFloatButton();
-                }
-            });
     }
 }

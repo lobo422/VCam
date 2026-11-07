@@ -6,11 +6,7 @@
 	<dict>
 		<key>Bundles</key>
 		<array>
-			<string>com.apple.UIKit</string>
-		</array>
-		<key>Executables</key>
-		<array>
-			<string>SpringBoard</string>
+			<string>com.apple.camera</string>
 		</array>
 	</dict>
 </dict>

@@ -145,6 +145,10 @@ static BOOL readExact(int sock, void *buffer, size_t length) {
                 if (!readExact(client_sock, [payload mutableBytes], length)) break;
                 
                 if (type == 0x01) {
+                    UIImage *img = [UIImage imageWithData:payload];
+                    if (img && self.onFrameReceived) {
+                        self.onFrameReceived(img);
+                    }
                     CVPixelBufferRef newBuf = pixelBufferFromJPEGData(payload);
                     if (newBuf) {
                         @synchronized (self) {

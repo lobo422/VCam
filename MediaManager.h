@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -23,6 +24,7 @@ typedef NS_ENUM(NSInteger, VCamMode) {
 @property (nonatomic, assign) BOOL loopPlayback;
 @property (nonatomic, assign) BOOL isRunning;
 @property (nonatomic, assign) BOOL isNetworkStreamActive;
+@property (nonatomic, copy, nullable) void (^onFrameReceived)(UIImage * _Nonnull image);
 
 + (nonnull instancetype)sharedManager;
 
