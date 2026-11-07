@@ -11,7 +11,7 @@ VCam_FILES = Tweak.xm MediaManager.m
 VCam_CFLAGS = -fobjc-arc
 VCam_CXXFLAGS = -fobjc-arc -std=c++17
 VCam_LDFLAGS = -std=c++17
-VCam_FRAMEWORKS = UIKit AVFoundation CoreMedia CoreVideo CoreImage MobileCoreServices ImageIO
+VCam_FRAMEWORKS = UIKit AVFoundation CoreMedia CoreVideo CoreImage MobileCoreServices ImageIO QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 

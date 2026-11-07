@@ -1,6 +1,7 @@
 #import "MediaManager.h"
 #import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
+#import <QuartzCore/QuartzCore.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
@@ -166,6 +167,54 @@ static CVPixelBufferRef pixelBufferFromJPEGData(NSData *data) {
 - (void)stopNetworkStream {
     self.isNetworkStreamActive = NO;
 }
+
+#pragma mark - Media Loading (Fallback local file)
+
+- (void)loadMediaFromURL:(NSURL *)url {
+    dispatch_async(_decodeQueue, ^{
+        AVAsset *asset = [AVAsset assetWithURL:url];
+        if (!asset) return;
+        
+        self.currentAsset = asset;
+        self.videoDuration = asset.duration;
+        
+        NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+        if (tracks.count > 0) {
+            AVAssetTrack *track = tracks.firstObject;
+            CGSize size = track.naturalSize;
+            CGAffineTransform t = track.preferredTransform;
+            size = CGSizeApplyAffineTransform(size, t);
+            size.width = fabs(size.width);
+            size.height = fabs(size.height);
+            if (size.width > 0 && size.height > 0) {
+                self.videoSize = size;
+            }
+        }
+        
+        [self resetReaders];
+        self.mode = VCamModeVideo;
+    });
+}
+
+- (void)resetReaders {
+    NSError *error = nil;
+    if (self.currentAsset) {
+        self.videoReader = [AVAssetReader assetReaderWithAsset:self.currentAsset error:&error];
+        NSArray<AVAssetTrack *> *videoTracks = [self.currentAsset tracksWithMediaType:AVMediaTypeVideo];
+        if (videoTracks.count > 0) {
+            NSDictionary *settings = @{
+                (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+            };
+            self.videoOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTracks.firstObject
+                                                                          outputSettings:settings];
+            self.videoOutput.alwaysCopiesSampleData = NO;
+            [self.videoReader addOutput:self.videoOutput];
+        }
+        [self.videoReader startReading];
+    }
+}
+
+#pragma mark - Frame Generation
 
 - (CMSampleBufferRef)nextVideoFrame {
     // 1. If in Live PC Stream mode:
