@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <objc/runtime.h>
 #import <substrate.h>
 #import "MediaManager.h"
 
@@ -8,7 +9,7 @@
 // MARK: - Global State
 // ============================================================================
 
-static BOOL g_vcamEnabled = YES; // Auto-enabled by default!
+static BOOL g_vcamEnabled = YES;
 static UIWindow *g_overlayWindow = nil;
 static UIButton *g_floatButton = nil;
 
@@ -29,7 +30,6 @@ static UIButton *g_floatButton = nil;
 @implementation VCamOverlayWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hitView = [super hitTest:point withEvent:event];
-    // If user touched anywhere outside the button, pass touch through to the app underneath!
     if (hitView == self || hitView == self.rootViewController.view) {
         return nil;
     }
@@ -44,6 +44,14 @@ static void handleTapGesture(UITapGestureRecognizer *gesture);
 static void setupFloatButton() {
     if (g_floatButton) return;
     
+    UIWindowScene *activeScene = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
+            activeScene = (UIWindowScene *)scene;
+            break;
+        }
+    }
+    
     CGFloat btnSize = 50;
     CGRect screen = [UIScreen mainScreen].bounds;
     
@@ -54,7 +62,7 @@ static void setupFloatButton() {
     g_floatButton.layer.shadowOffset = CGSizeMake(0, 2);
     g_floatButton.layer.shadowOpacity = 0.3;
     g_floatButton.layer.shadowRadius = 4;
-    g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9]; // Green
+    g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
     
     [g_floatButton setTitle:@"📷" forState:UIControlStateNormal];
     g_floatButton.titleLabel.font = [UIFont systemFontOfSize:24];
@@ -67,8 +75,11 @@ static void setupFloatButton() {
         initWithTarget:g_floatButton action:@selector(handleTap:)];
     [g_floatButton addGestureRecognizer:tap];
     
-    // Transparent pass-through window
-    g_overlayWindow = [[VCamOverlayWindow alloc] initWithFrame:screen];
+    if (activeScene) {
+        g_overlayWindow = [[VCamOverlayWindow alloc] initWithWindowScene:activeScene];
+    } else {
+        g_overlayWindow = [[VCamOverlayWindow alloc] initWithFrame:screen];
+    }
     g_overlayWindow.windowLevel = UIWindowLevelAlert + 100;
     g_overlayWindow.hidden = NO;
     g_overlayWindow.backgroundColor = [UIColor clearColor];
@@ -213,25 +224,15 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 }
 
 // ============================================================================
-// MARK: - Hook AVCaptureSession / Video Output
+// MARK: - Delegate Proxy Pattern (Universal Video Output Interception)
 // ============================================================================
 
-%group VCamHooks
+@interface VCamSampleBufferProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
+@property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> originalDelegate;
+@end
 
-%hook AVCaptureSession
-- (void)startRunning { %orig; }
-- (void)stopRunning { %orig; }
-%end
+@implementation VCamSampleBufferProxy
 
-%hook AVCaptureVideoDataOutput
-- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate 
-                          queue:(dispatch_queue_t)queue {
-    %orig;
-}
-%end
-
-// Intercept frame delegate callback -> substitute with live PC stream or video frames
-%hook NSObject
 - (void)captureOutput:(AVCaptureOutput *)output 
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer 
            fromConnection:(AVCaptureConnection *)connection {
@@ -239,24 +240,74 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
     if (g_vcamEnabled && [[MediaManager sharedManager] isRunning]) {
         CMSampleBufferRef fakeFrame = [[MediaManager sharedManager] nextVideoFrame];
         if (fakeFrame) {
-            %orig(output, fakeFrame, connection);
+            if ([self.originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+                [self.originalDelegate captureOutput:output didOutputSampleBuffer:fakeFrame fromConnection:connection];
+            }
             CFRelease(fakeFrame);
             return;
         }
     }
+    
+    if ([self.originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+        [self.originalDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+    }
+}
+
+- (void)captureOutput:(AVCaptureOutput *)output 
+  didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer 
+       fromConnection:(AVCaptureConnection *)connection {
+    if ([self.originalDelegate respondsToSelector:@selector(captureOutput:didDropSampleBuffer:fromConnection:)]) {
+        [self.originalDelegate captureOutput:output didDropSampleBuffer:sampleBuffer fromConnection:connection];
+    }
+}
+
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    if (aSelector == @selector(captureOutput:didOutputSampleBuffer:fromConnection:)) return YES;
+    if (aSelector == @selector(captureOutput:didDropSampleBuffer:fromConnection:)) return YES;
+    return [self.originalDelegate respondsToSelector:aSelector];
+}
+
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    return self.originalDelegate;
+}
+
+@end
+
+// ============================================================================
+// MARK: - Hook AVCaptureSession / Video Output
+// ============================================================================
+
+%group VCamHooks
+
+%hook UIViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!g_floatButton) {
+        setupFloatButton();
+    }
+}
+%end
+
+%hook AVCaptureSession
+- (void)startRunning {
+    %orig;
+    [[MediaManager sharedManager] start];
+}
+- (void)stopRunning {
     %orig;
 }
 %end
 
-%hook AVCapturePhotoOutput
-- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings 
-                        delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
-    %orig;
-}
-%end
-
-%hook AVCaptureVideoPreviewLayer
-- (void)setSession:(AVCaptureSession *)session {
+%hook AVCaptureVideoDataOutput
+- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate 
+                          queue:(dispatch_queue_t)queue {
+    if (delegate && ![delegate isKindOfClass:[VCamSampleBufferProxy class]]) {
+        VCamSampleBufferProxy *proxy = [[VCamSampleBufferProxy alloc] init];
+        proxy.originalDelegate = delegate;
+        objc_setAssociatedObject(self, "VCamSampleBufferProxyKey", proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        %orig(proxy, queue);
+        return;
+    }
     %orig;
 }
 %end
