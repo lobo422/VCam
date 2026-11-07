@@ -47,47 +47,47 @@
 
 #pragma mark - Live Network Stream (PC to iPhone over USB)
 
+static CIContext *g_ciContext = nil;
+
 static CVPixelBufferRef pixelBufferFromJPEGData(NSData *data) {
     if (!data || data.length == 0) return NULL;
     
-    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
-    if (!source) return NULL;
-    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, NULL);
-    CFRelease(source);
-    if (!cgImage) return NULL;
+    CIImage *ciImage = [CIImage imageWithData:data];
+    if (!ciImage) return NULL;
     
-    size_t width = CGImageGetWidth(cgImage);
-    size_t height = CGImageGetHeight(cgImage);
+    if (!g_ciContext) {
+        g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @(NO)}];
+    }
+    
+    size_t width = (size_t)ciImage.extent.size.width;
+    size_t height = (size_t)ciImage.extent.size.height;
+    if (width == 0 || height == 0) return NULL;
     
     CVPixelBufferRef pxbuffer = NULL;
     NSDictionary *options = @{
-        (NSString *)kCVPixelBufferCGImageCompatibilityKey: @(YES),
-        (NSString *)kCVPixelBufferCGBitmapContextCompatibilityKey: @(YES),
         (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
     };
     CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                          kCVPixelFormatType_32BGRA,
+                                          kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                                           (__bridge CFDictionaryRef)options,
                                           &pxbuffer);
     if (status != kCVReturnSuccess || !pxbuffer) {
-        CGImageRelease(cgImage);
         return NULL;
     }
     
-    CVPixelBufferLockBaseAddress(pxbuffer, 0);
-    void *pxdata = CVPixelBufferGetBaseAddress(pxbuffer);
-    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pxbuffer);
-    
-    CGColorSpaceRef rgbColorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef context = CGBitmapContextCreate(pxdata, width, height, 8, bytesPerRow, rgbColorSpace,
-                                                 kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
-    CGContextDrawImage(context, CGRectMake(0, 0, width, height), cgImage);
-    CGColorSpaceRelease(rgbColorSpace);
-    CGContextRelease(context);
-    
-    CVPixelBufferUnlockBaseAddress(pxbuffer, 0);
-    CGImageRelease(cgImage);
+    [g_ciContext render:ciImage toCVPixelBuffer:pxbuffer];
     return pxbuffer;
+}
+
+static BOOL readExact(int sock, void *buffer, size_t length) {
+    size_t total = 0;
+    uint8_t *buf = (uint8_t *)buffer;
+    while (total < length) {
+        ssize_t n = recv(sock, buf + total, length - total, 0);
+        if (n <= 0) return NO;
+        total += n;
+    }
+    return YES;
 }
 
 - (void)startNetworkStreamWithHost:(NSString *)host port:(int)port {
@@ -134,8 +134,7 @@ static CVPixelBufferRef pixelBufferFromJPEGData(NSData *data) {
             
             while (self.isNetworkStreamActive) {
                 uint8_t header[9];
-                ssize_t n = recv(client_sock, header, 9, MSG_WAITALL);
-                if (n != 9) break;
+                if (!readExact(client_sock, header, 9)) break;
                 if (memcmp(header, "LIVE", 4) != 0) break;
                 
                 uint8_t type = header[4];
@@ -143,8 +142,7 @@ static CVPixelBufferRef pixelBufferFromJPEGData(NSData *data) {
                 if (length > 10 * 1024 * 1024) break;
                 
                 NSMutableData *payload = [NSMutableData dataWithLength:length];
-                n = recv(client_sock, [payload mutableBytes], length, MSG_WAITALL);
-                if (n != length) break;
+                if (!readExact(client_sock, [payload mutableBytes], length)) break;
                 
                 if (type == 0x01) {
                     CVPixelBufferRef newBuf = pixelBufferFromJPEGData(payload);
